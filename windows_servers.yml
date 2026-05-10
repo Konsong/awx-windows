@@ -1,0 +1,65 @@
+---
+# Ortak Windows / patch ayarları (playbook değişkenleriyle geçersiz kılınabilir)
+# Bu dosya inventory/hosts.yml ile aynı dizin ağacında olduğu için Ansible tarafından yüklenir.
+
+# WinRM: NTLM başarısız olursa ve ortamınız uygunsa deneyin (Windows tarafında CredSSP gerekir):
+# ansible_winrm_transport: credssp
+
+# SSH ile Windows: uzun WU sırasında oturumun düşmemesi için (win_updates belgesi önerisi)
+# WinRM kullanıyorsanız bu satır etkisizdir; zarar vermez.
+ansible_ssh_args: "-o ControlMaster=no -o ServerAliveInterval=30"
+
+# --- win_updates politikası ---
+# '*' = tüm kategoriler (Defender tanımları vb.); Ayarlar uygulaması ile uyum için gerekli.
+win_updates_category_names:
+  - "*"
+
+# Microsoft kataloğu (Codeschöpfer / WUA–Ayarlar uyumu). WSUS zorunluysa: managed_server veya default
+win_updates_server_selection: windows_update
+
+# HKLM PauseUpdatesExpiryTime — duraklatılmış güncellemeyi kaldırır (makale: Revoke 30d block)
+win_updates_revoke_pause_expiry: false
+
+# SoftwareDistribution + catroot2 silme — yüksek müdahale; yalnızca bakım penceresinde true yapın
+win_updates_reset_wu_cache: false
+
+# startscan = UsoClient StartScan | deep = RefreshSettings + ScanInstallWait (uzun sürebilir; gerekirse uso_scan_wait_sec artırın)
+win_updates_uso_scan_mode: startscan
+
+# Kurulum öncesi WUA/USO (Ayarlar vs API senkronu — operasyon planı önerisi)
+win_updates_wuauclt_detect_before_install: true
+win_updates_pre_install_wait_sec: 20
+# true: win_updates öncesi de USO çalışır (deep uzun sürer; çoğu ortamda yalnızca detect yeter)
+win_updates_uso_before_install: false
+
+win_updates_reboot: true
+win_updates_reboot_timeout: 3600
+
+# MSRT vb. BrowseOnly güncellemelerinin atlanmaması için false (Ayarlar'da görünen kuyruk ile uyum)
+win_updates_skip_optional: false
+
+# win_updates modülü günlüğü (dizin playbook ile oluşturulur). Kapatmak için: win_updates_log_enabled: false
+win_updates_log_enabled: true
+win_updates_log_dir: 'C:\AnsibleLogs'
+win_updates_log_path: 'C:\AnsibleLogs\win_updates.log'
+
+# Task Scheduler sorunlarında açın:
+# win_updates_use_system_become: true
+
+win_updates_reject_list: []
+win_updates_accept_list: []
+
+# Çoklu kurulum: win_updates en fazla bu kadar kez tekrarlanır (1 + retries)
+win_updates_max_passes: 3
+# until koşulu sağlanana kadar denemeler arası bekleme (saniye)
+win_updates_retry_delay_sec: 30
+
+# Modül yeniden başlattıysa doğrulama öncesi ek bekleme (saniye)
+win_updates_post_reboot_delay_sec: 90
+# Doğrulama öncesi USO taraması (Ayarlar / WUA senkronu)
+win_updates_usoclient_before_verify: true
+# USO StartScan sonrası kısa bekleme (saniye)
+win_updates_uso_scan_wait_sec: 45
+
+# ansible-playbook -e win_updates_verify_debug=true ile tam verify_all çıktısı
+win_updates_verify_debug: false

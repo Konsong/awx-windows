@@ -1,0 +1,213 @@
+---
+# Windows Server: Windows Update kurulumu ve doğrulama
+# Çalıştırma: ansible-playbook playbooks/windows_update.yml
+
+- name: Windows Server - Windows Update
+  hosts: windows_servers
+  gather_facts: true
+
+  tasks:
+    - name: Bağlantı testi
+      ansible.windows.win_ping:
+
+    - name: Windows Update modül günlük dizini
+      ansible.windows.win_file:
+        path: "{{ win_updates_log_dir | default('C:\\AnsibleLogs') }}"
+        state: directory
+      when: win_updates_log_enabled | default(true) | bool
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Windows Update ve BITS servislerinin çalışır olması
+      ansible.windows.win_service:
+        name: "{{ item }}"
+        state: started
+      loop:
+        - wuauserv
+        - BITS
+
+    - name: Güncelleme duraklatmasını kaldır (PauseUpdatesExpiryTime)
+      ansible.windows.win_shell: |
+        $pause = (Get-Date).AddDays(0)
+        $pause = $pause.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        if (-not (Test-Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings')) {
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -Force | Out-Null
+        }
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -Name 'PauseUpdatesExpiryTime' -Value $pause
+      when: win_updates_revoke_pause_expiry | default(false) | bool
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Windows Update önbelleğini sıfırla (SoftwareDistribution, catroot2)
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'SilentlyContinue'
+        Stop-Service -Name BITS, WaaSMedicSvc, wuauserv, CryptSvc -Force
+        Remove-Item -Path C:\Windows\System32\catroot2 -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path C:\Windows\SoftwareDistribution -Recurse -Force -ErrorAction SilentlyContinue
+        Start-Service -Name BITS, wuauserv, CryptSvc -ErrorAction SilentlyContinue
+        Start-Service -Name WaaSMedicSvc -ErrorAction SilentlyContinue
+      when: win_updates_reset_wu_cache | default(false) | bool
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    # Ayarlar ile WUA aynı anlık durumu göstermeyebilir; kurulum öncesi hafif tetikleme yardımcı olabilir.
+    - name: WUA tespit kuyruğu (wuauclt /detectnow)
+      ansible.windows.win_command: C:\Windows\System32\wuauclt.exe /detectnow
+      failed_when: false
+      changed_when: false
+      when: win_updates_wuauclt_detect_before_install | default(true) | bool
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Kurulum öncesi kısa bekleme (WUA)
+      ansible.builtin.pause:
+        seconds: "{{ win_updates_pre_install_wait_sec | default(20) | int }}"
+      delegate_to: localhost
+      when: win_updates_wuauclt_detect_before_install | default(true) | bool
+
+    - name: Kurulum öncesi USO StartScan
+      ansible.windows.win_command: C:\Windows\System32\UsoClient.exe StartScan
+      failed_when: false
+      changed_when: false
+      when:
+        - win_updates_uso_before_install | default(false) | bool
+        - (win_updates_uso_scan_mode | default('startscan')) != 'deep'
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Kurulum öncesi USO RefreshSettings ve ScanInstallWait
+      ansible.windows.win_shell: |
+        & C:\Windows\System32\UsoClient.exe RefreshSettings
+        & C:\Windows\System32\UsoClient.exe ScanInstallWait
+      failed_when: false
+      changed_when: false
+      when:
+        - win_updates_uso_before_install | default(false) | bool
+        - (win_updates_uso_scan_mode | default('startscan')) == 'deep'
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Kurulum öncesi USO sonrası bekleme
+      ansible.builtin.pause:
+        seconds: "{{ win_updates_uso_scan_wait_sec | default(45) | int }}"
+      delegate_to: localhost
+      when: win_updates_uso_before_install | default(false) | bool
+
+    - name: Windows güncellemelerini yükle (çoklu tur, gerekirse yeniden başlat)
+      ansible.windows.win_updates:
+        category_names: "{{ win_updates_category_names | default(['*']) }}"
+        server_selection: "{{ win_updates_server_selection | default('windows_update') }}"
+        reboot: "{{ win_updates_reboot | default(true) | bool }}"
+        reboot_timeout: "{{ win_updates_reboot_timeout | default(3600) | int }}"
+        skip_optional: "{{ win_updates_skip_optional | default(false) | bool }}"
+        reject_list: "{{ win_updates_reject_list | default([]) }}"
+        accept_list: "{{ win_updates_accept_list | default([]) }}"
+        log_path: "{{ (win_updates_log_path | default('C:\\AnsibleLogs\\win_updates.log')) if (win_updates_log_enabled | default(true) | bool) else omit }}"
+      register: patch_result
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+      until: >-
+        (patch_result.installed_update_count | default(0) | int == 0) and
+        (not patch_result.reboot_required | default(false) | bool)
+      retries: "{{ (win_updates_max_passes | default(3) | int) - 1 }}"
+      delay: "{{ win_updates_retry_delay_sec | default(30) | int }}"
+
+    - name: Kurulum özeti
+      ansible.builtin.debug:
+        msg:
+          - "Yüklenen/indirilen güncelleme sayısı: {{ patch_result.installed_update_count | default('n/a') }}"
+          - "Başarısız güncelleme: {{ patch_result.failed_update_count | default('n/a') }}"
+          - "Yeniden başlatma gerekli (modül çıktısı): {{ patch_result.reboot_required | default('n/a') }}"
+          - "Modül tarafından yeniden başlatıldı: {{ patch_result.rebooted | default('n/a') }}"
+      when: patch_result is defined
+
+    - name: Başarısız güncelleme ayrıntıları
+      ansible.builtin.debug:
+        msg: "KB={{ item.value.kb | default([]) }} | {{ item.value.title | default('') }} | {{ item.value.failure_msg | default('') }}"
+      loop: "{{ patch_result.updates | dict2items | selectattr('value.installed', 'equalto', false) | list }}"
+      loop_control:
+        label: "{{ item.value.kb | default([]) | join(',') }}"
+      when:
+        - patch_result is defined
+        - patch_result.updates is defined
+        - patch_result.failed_update_count | default(0) | int > 0
+
+    - name: Yeniden başlatma sonrası bekleme (WUA yerleşsin)
+      ansible.builtin.pause:
+        seconds: "{{ win_updates_post_reboot_delay_sec | default(90) | int }}"
+      delegate_to: localhost
+      when:
+        - patch_result is defined
+        - patch_result.rebooted | default(false) | bool
+
+    - name: USO ile güncelleme taraması (StartScan)
+      ansible.windows.win_command: C:\Windows\System32\UsoClient.exe StartScan
+      register: win_updates_uso_scan
+      failed_when: false
+      changed_when: win_updates_uso_scan.rc == 0
+      when:
+        - patch_result is defined
+        - win_updates_usoclient_before_verify | default(true) | bool
+        - (win_updates_uso_scan_mode | default('startscan')) != 'deep'
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: USO RefreshSettings ve ScanInstallWait (derin tarama, uzun sürebilir)
+      ansible.windows.win_shell: |
+        & C:\Windows\System32\UsoClient.exe RefreshSettings
+        & C:\Windows\System32\UsoClient.exe ScanInstallWait
+      register: win_updates_uso_scan
+      failed_when: false
+      changed_when: win_updates_uso_scan.rc == 0
+      when:
+        - patch_result is defined
+        - win_updates_usoclient_before_verify | default(true) | bool
+        - (win_updates_uso_scan_mode | default('startscan')) == 'deep'
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: USO taraması sonrası bekleme
+      ansible.builtin.pause:
+        seconds: "{{ win_updates_uso_scan_wait_sec | default(45) | int }}"
+      delegate_to: localhost
+      when:
+        - patch_result is defined
+        - win_updates_usoclient_before_verify | default(true) | bool
+
+    - name: Bekleyen güncellemeleri ara (tüm kategoriler, Ayarlar ile uyum)
+      ansible.windows.win_updates:
+        category_names: "*"
+        server_selection: "{{ win_updates_server_selection | default('windows_update') }}"
+        state: searched
+        skip_optional: "{{ win_updates_skip_optional | default(false) | bool }}"
+        reject_list: "{{ win_updates_reject_list | default([]) }}"
+        accept_list: "{{ win_updates_accept_list | default([]) }}"
+        log_path: "{{ (win_updates_log_path | default('C:\\AnsibleLogs\\win_updates.log')) if (win_updates_log_enabled | default(true) | bool) else omit }}"
+      register: verify_all
+      become: "{{ win_updates_use_system_become | default(false) | bool }}"
+      become_method: runas
+      become_user: SYSTEM
+
+    - name: Doğrulama API çıktısı (tanı)
+      ansible.builtin.debug:
+        var: verify_all
+      when:
+        - verify_all is defined
+        - win_updates_verify_debug | default(false) | bool
+
+    - name: Doğrulama — bekleyen güncelleme kalmamalı
+      ansible.builtin.assert:
+        that:
+          - verify_all.found_update_count == 0
+        fail_msg: >-
+          Doğrulama başarısız: {{ verify_all.found_update_count }} güncelleme hâlâ bekliyor (tüm kategoriler).
+          GPO/WSUS veya yeniden başlatma gereksinimini kontrol edin; playbook'u tekrar çalıştırın.
