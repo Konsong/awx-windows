@@ -1,0 +1,137 @@
+---
+- name: Production Windows patching
+  hosts: windows
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: false
+
+  vars:
+    server_selection_mode: "{{ 'managed_server' if use_wsus else 'windows_update' }}"
+
+  tasks:
+
+    - name: Display current target
+      debug:
+        msg: "Patching {{ inventory_hostname }}"
+
+    - name: Ensure log directory exists
+      ansible.windows.win_file:
+        path: C:\Automation\logs\update
+        state: directory
+
+    - name: Check pending reboot
+      ansible.windows.win_shell: |
+        if (
+          Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+        ) {
+          Write-Output "REBOOT_REQUIRED"
+        }
+      register: reboot_check
+      changed_when: false
+
+    - name: Reboot if pending reboot exists
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when: reboot_check.stdout is search('REBOOT_REQUIRED')
+
+    - name: Gather VM information from VMware
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        datacenter: "{{ vm_datacenter }}"
+        name: "{{ ansible_hostname }}"
+      delegate_to: localhost
+      register: vm_info
+      when: snapshot_enabled
+
+    - name: Create VMware snapshot before patching
+      community.vmware.vmware_guest_snapshot:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        validate_certs: false
+        datacenter: "{{ vm_datacenter }}"
+        folder: "{{ vm_info.instance.hw_folder }}"
+        name: "{{ ansible_hostname }}"
+        snapshot_name: "{{ snapshot_name }}"
+        description: "Automatic snapshot before Windows patching"
+        memory_dump: false
+        quiesce: true
+        state: present
+      delegate_to: localhost
+      when: snapshot_enabled
+
+    - name: Search for available updates
+      ansible.windows.win_updates:
+        category_names: "{{ update_categories }}"
+        reject_list: "{{ reject_list }}"
+        state: searched
+        server_selection: "{{ server_selection_mode }}"
+      register: update_scan
+
+    - name: Show scan result
+      debug:
+        var: update_scan.found_update_count
+
+    - name: Install Windows updates
+      ansible.windows.win_updates:
+        category_names: "{{ update_categories }}"
+        reject_list: "{{ reject_list }}"
+        state: installed
+        reboot: false
+        server_selection: "{{ server_selection_mode }}"
+        log_path: "C:\\Automation\\logs\\update\\patch.log"
+      register: install_result
+      become: true
+      become_method: runas
+      become_user: SYSTEM
+      retries: 3
+      delay: 120
+      until: install_result is succeeded
+
+    - name: Reboot normal Windows servers if required
+      ansible.windows.win_reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when:
+        - install_result.reboot_required
+        - inventory_hostname not in groups['domain_controllers']
+
+    - name: Notify for DC reboot requirement
+      debug:
+        msg: "Domain Controller requires reboot: {{ inventory_hostname }}"
+      when:
+        - install_result.reboot_required
+        - inventory_hostname in groups['domain_controllers']
+
+    - name: Wait for WinRM after reboot
+      wait_for:
+        host: "{{ ansible_host }}"
+        port: 5985
+        timeout: 600
+      delegate_to: localhost
+
+    - name: Generate mail body
+      ansible.builtin.set_fact:
+        mail_body: |
+          Windows Update Report
+
+          Server: {{ inventory_hostname }}
+          Installed Updates: {{ install_result.installed_update_count | default(0) }}
+          Failed Updates: {{ install_result.failed_update_count | default(0) }}
+          Reboot Required: {{ install_result.reboot_required | default(false) }}
+
+    - name: Send patch report email
+      community.general.mail:
+        host: "{{ smtp_host }}"
+        port: "{{ smtp_port }}"
+        username: "{{ smtp_username }}"
+        password: "{{ smtp_password }}"
+        to: "{{ mail_to }}"
+        from: "{{ mail_from }}"
+        subject: "Windows Patch Report - {{ inventory_hostname }}"
+        body: "{{ mail_body }}"
+        secure: starttls
+      delegate_to: localhost
+
